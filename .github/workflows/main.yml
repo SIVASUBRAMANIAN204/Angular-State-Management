@@ -1,64 +1,45 @@
-name: Deploy Angular to AWS
+name: Deploy to AWS
 
 on:
   push:
-    branches: [ main ]  # Deploy when you push to main branch
+    branches: [ main ]
 
 env:
+  S3_BUCKET: state-management-ngrx
+  CLOUDFRONT_ID: E3ENQ34UBKH1H0
   AWS_REGION: us-east-1
-  S3_BUCKET: your-bucket-name  # Replace with your S3 bucket name
-  CLOUDFRONT_ID: your-distribution-id  # Replace with your CloudFront ID
 
 jobs:
   deploy:
-    name: Build and Deploy
     runs-on: ubuntu-latest
     
     steps:
-      # 1. Get your code
       - name: Checkout code
         uses: actions/checkout@v4
       
-      # 2. Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          cache: 'npm'
       
-      # 3. Install dependencies
       - name: Install dependencies
         run: npm ci
       
-      # 4. Build Angular app
       - name: Build Angular app
         run: npm run build -- --configuration production
       
-      # 5. Configure AWS
-      - name: Configure AWS credentials
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
-      # 6. Upload to S3
-      - name: Upload to S3
-        run: |
-          # Find your build folder (usually dist/your-project-name)
-          aws s3 sync ./dist/ s3://${{ env.S3_BUCKET }} \
-            --delete \
-            --cache-control "max-age=31536000"
+      - name: Deploy to S3
+        run: aws s3 sync ./dist/ s3://${{ env.S3_BUCKET }} --delete
       
-      # 7. Clear CloudFront cache
       - name: Clear CloudFront cache
-        run: |
-          aws cloudfront create-invalidation \
-            --distribution-id ${{ env.CLOUDFRONT_ID }} \
-            --paths "/*"
+        run: aws cloudfront create-invalidation --distribution-id ${{ env.CLOUDFRONT_ID }} --paths "/*"
       
-      # 8. Show success message
-      - name: Deployment complete
-        run: |
-          echo "✅ Deployment successful!"
-          echo "🌐 Your app is live at: https://${{ env.CLOUDFRONT_ID }}.cloudfront.net"
+      - name: Done
+        run: echo "✅ Deployed to https://${{ env.CLOUDFRONT_ID }}.cloudfront.net"
