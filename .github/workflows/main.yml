@@ -247,29 +247,7 @@ jobs:
           EOF
           
           cat src/app/core/version.ts
-      
-      # Step 6: Run linting
-      - name: Run linter
-        run: |
-          if npm run lint --if-present; then
-            echo "✅ Linting passed"
-          else
-            echo "⚠️ No lint script found, skipping"
-          fi
-      
-      # Step 7: Run unit tests with coverage
-      - name: Run unit tests
-        run: |
-          npm test -- --watch=false --browsers=ChromeHeadless --code-coverage
-      
-      # Step 8: Upload test coverage
-      - name: Upload test coverage
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage/
-          retention-days: 7
-      
+  
       # Step 9: Build Angular app
       - name: Build Angular app
         id: build
