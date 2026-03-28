@@ -6,40 +6,44 @@ on:
 
 env:
   S3_BUCKET: state-management-ngrx
-  CLOUDFRONT_ID: E3ENQ34UBKH1H0
   AWS_REGION: us-east-1
+  # Note: CLOUDFRONT_ID is for API calls, not for the URL
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '18'
       
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
+      - run: npm run build -- --configuration production
       
-      - name: Build Angular app
-        run: npm run build -- --configuration production
-      
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
       - name: Deploy to S3
-        run: aws s3 sync ./dist/ s3://${{ env.S3_BUCKET }} --delete
+        run: |
+          BUILD_FOLDER=$(find dist -name "index.html" -exec dirname {} \; | head -1)
+          aws s3 sync "$BUILD_FOLDER" s3://${{ env.S3_BUCKET }} --delete
       
-      - name: Clear CloudFront cache
-        run: aws cloudfront create-invalidation --distribution-id ${{ env.CLOUDFRONT_ID }} --paths "/*"
-      
-      - name: Done
-        run: echo "✅ Deployed to https://${{ env.CLOUDFRONT_ID }}.cloudfront.net"
+      - name: Show URLs
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ DEPLOYMENT COMPLETE!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "🌐 S3 URL (immediate access):"
+          echo "   http://${{ env.S3_BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
+          echo ""
+          echo "🚀 CloudFront URL (after 5-15 mins):"
+          echo "   Check your CloudFront distribution domain name"
+          echo "   Go to AWS Console → CloudFront → Your Distribution"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
