@@ -7,7 +7,6 @@ on:
 env:
   S3_BUCKET: state-management-ngrx
   AWS_REGION: us-east-1
-  # Note: CLOUDFRONT_ID is for API calls, not for the URL
 
 jobs:
   deploy:
@@ -29,21 +28,52 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
+      # Fix bucket permissions
+      - name: Configure S3 bucket for static website
+        run: |
+          # Turn off block public access
+          aws s3api put-public-access-block \
+            --bucket ${{ env.S3_BUCKET }} \
+            --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
+          
+          # Set bucket policy for public read
+          cat > bucket-policy.json << EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "PublicReadGetObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::${{ env.S3_BUCKET }}/*"
+              }
+            ]
+          }
+          EOF
+          
+          aws s3api put-bucket-policy \
+            --bucket ${{ env.S3_BUCKET }} \
+            --policy file://bucket-policy.json
+          
+          # Enable static website hosting
+          aws s3 website "s3://${{ env.S3_BUCKET }}" \
+            --index-document index.html \
+            --error-document index.html
+          
+          echo "✅ Bucket configured for public access"
+      
+      # Deploy files
       - name: Deploy to S3
         run: |
           BUILD_FOLDER=$(find dist -name "index.html" -exec dirname {} \; | head -1)
-          aws s3 sync "$BUILD_FOLDER" s3://${{ env.S3_BUCKET }} --delete
+          aws s3 sync "$BUILD_FOLDER" "s3://${{ env.S3_BUCKET }}" \
+            --delete \
+            --acl public-read
       
-      - name: Show URLs
+      # Show URL
+      - name: Show URL
         run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "✅ DEPLOYMENT COMPLETE!"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          echo "🌐 S3 URL (immediate access):"
-          echo "   http://${{ env.S3_BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
-          echo ""
-          echo "🚀 CloudFront URL (after 5-15 mins):"
-          echo "   Check your CloudFront distribution domain name"
-          echo "   Go to AWS Console → CloudFront → Your Distribution"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          S3_URL="http://${{ env.S3_BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
+          echo "✅ Deployed successfully!"
+          echo "🌐 Visit: $S3_URL"
