@@ -32,7 +32,7 @@ jobs:
       
       # 4. Build Angular app
       - name: Build Angular app
-        run: npm run build -- --prod
+        run: npm run build -- --configuration production
       
       # 5. Configure AWS
       - name: Configure AWS credentials
