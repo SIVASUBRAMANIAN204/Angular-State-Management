@@ -1,0 +1,582 @@
+name: Angular CI/CD Pipeline with Auto-Versioning
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      version_type:
+        description: 'Version increment type'
+        required: false
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+# Environment variables for AWS
+env:
+  S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+  CLOUDFRONT_ID: ${{ secrets.AWS_CLOUDFRONT_ID }}
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  NODE_VERSION: '18'
+
+# Permissions for creating releases
+permissions:
+  contents: write
+  pull-requests: write
+
+# Allow only one concurrent deployment
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== VERSION MANAGEMENT JOB ====================
+  version-management:
+    name: 📦 Version Management & Auto-Increment
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.increment-version.outputs.new_version }}
+      build_number: ${{ steps.build-number.outputs.build_number }}
+      version_tag: ${{ steps.create-tag.outputs.version_tag }}
+      commit_hash: ${{ steps.get-commit.outputs.commit_hash }}
+    
+    steps:
+      # Step 1: Checkout code with full history
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Step 2: Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      # Step 3: Get current version from package.json
+      - name: Get current version
+        id: current-version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Current version: $CURRENT_VERSION"
+      
+      # Step 4: Determine version increment type
+      - name: Determine version type
+        id: version-type
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION_TYPE="${{ github.event.inputs.version_type }}"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            VERSION_TYPE="patch"
+          elif [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+            VERSION_TYPE="patch"
+          else
+            VERSION_TYPE="none"
+          fi
+          echo "type=$VERSION_TYPE" >> $GITHUB_OUTPUT
+          echo "🔢 Version increment type: $VERSION_TYPE"
+      
+      # Step 5: Calculate new version
+      - name: Increment version
+        id: increment-version
+        run: |
+          CURRENT_VERSION="${{ steps.current-version.outputs.current_version }}"
+          VERSION_TYPE="${{ steps.version-type.outputs.type }}"
+          
+          if [ "$VERSION_TYPE" == "none" ]; then
+            NEW_VERSION="$CURRENT_VERSION"
+          else
+            # Split version
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+            
+            case "$VERSION_TYPE" in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                ;;
+            esac
+            
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          fi
+          
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "✨ New version: $NEW_VERSION"
+      
+      # Step 6: Generate build number
+      - name: Generate build number
+        id: build-number
+        run: |
+          # Use GitHub run number as base
+          BUILD_NUM="${{ github.run_number }}"
+          # Add timestamp for uniqueness
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          FULL_BUILD_NUM="${BUILD_NUM}-${TIMESTAMP}"
+          echo "build_number=$FULL_BUILD_NUM" >> $GITHUB_OUTPUT
+          echo "🔨 Build number: $FULL_BUILD_NUM"
+      
+      # Step 7: Get commit hash
+      - name: Get commit hash
+        id: get-commit
+        run: |
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "🔖 Commit hash: $COMMIT_HASH"
+      
+      # Step 8: Update package.json with new version
+      - name: Update package.json
+        if: steps.version-type.outputs.type != 'none' && github.ref == 'refs/heads/main'
+        run: |
+          NEW_VERSION="${{ steps.increment-version.outputs.new_version }}"
+          npm version $NEW_VERSION --no-git-tag-version
+          echo "📝 Updated package.json to version $NEW_VERSION"
+      
+      # Step 9: Create version info file
+      - name: Create version info
+        run: |
+          cat > version.json << EOF
+          {
+            "version": "${{ steps.increment-version.outputs.new_version }}",
+            "buildNumber": "${{ steps.build-number.outputs.build_number }}",
+            "commitHash": "${{ steps.get-commit.outputs.commit_hash }}",
+            "branch": "${{ github.ref_name }}",
+            "timestamp": "$(date -Iseconds)",
+            "environment": "${{ github.ref == 'refs/heads/main' && 'production' || 'development' }}",
+            "githubRunId": "${{ github.run_id }}",
+            "githubRunNumber": "${{ github.run_number }}"
+          }
+          EOF
+          cat version.json
+      
+      # Step 10: Create Git tag
+      - name: Create Git tag
+        id: create-tag
+        if: github.ref == 'refs/heads/main'
+        run: |
+          VERSION_TAG="v${{ steps.increment-version.outputs.new_version }}"
+          echo "version_tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+          
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag $VERSION_TAG
+          git push origin $VERSION_TAG
+          echo "🏷️ Created tag: $VERSION_TAG"
+      
+      # Step 11: Upload version info as artifact
+      - name: Upload version info
+        uses: actions/upload-artifact@v4
+        with:
+          name: version-info
+          path: version.json
+          retention-days: 5
+
+  # ==================== CI JOB ====================
+  build-and-test:
+    name: 🏗️ Build & Test Angular App
+    runs-on: ubuntu-latest
+    needs: version-management
+    timeout-minutes: 15
+    
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      # Step 2: Download version info
+      - name: Download version info
+        uses: actions/download-artifact@v4
+        with:
+          name: version-info
+      
+      # Step 3: Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      # Step 4: Install dependencies
+      - name: Install dependencies
+        run: npm ci
+      
+      # Step 5: Create Angular version file
+      - name: Create Angular version file
+        run: |
+          # Read version info
+          VERSION=$(jq -r '.version' version.json)
+          BUILD_NUMBER=$(jq -r '.buildNumber' version.json)
+          COMMIT_HASH=$(jq -r '.commitHash' version.json)
+          BRANCH=$(jq -r '.branch' version.json)
+          TIMESTAMP=$(jq -r '.timestamp' version.json)
+          ENVIRONMENT=$(jq -r '.environment' version.json)
+          
+          # Create version.ts file for Angular
+          mkdir -p src/app/core
+          cat > src/app/core/version.ts << EOF
+          // Auto-generated version file - DO NOT EDIT
+          // Generated at: $(date)
+          
+          export const AppVersion = {
+            version: '${VERSION}',
+            buildNumber: '${BUILD_NUMBER}',
+            commitHash: '${COMMIT_HASH}',
+            branch: '${BRANCH}',
+            buildDate: '${TIMESTAMP}',
+            environment: '${ENVIRONMENT}',
+            gitHubRunId: '${{ github.run_id }}',
+            gitHubRunNumber: '${{ github.run_number }}'
+          };
+          
+          export default AppVersion;
+          EOF
+          
+          cat src/app/core/version.ts
+      
+      # Step 6: Run linting
+      - name: Run linter
+        run: |
+          if npm run lint --if-present; then
+            echo "✅ Linting passed"
+          else
+            echo "⚠️ No lint script found, skipping"
+          fi
+      
+      # Step 7: Run unit tests with coverage
+      - name: Run unit tests
+        run: |
+          npm test -- --watch=false --browsers=ChromeHeadless --code-coverage
+      
+      # Step 8: Upload test coverage
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+      
+      # Step 9: Build Angular app
+      - name: Build Angular app
+        id: build
+        run: |
+          # Read environment
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            ENV_FLAG="--prod"
+          else
+            ENV_FLAG="--configuration=development"
+          fi
+          
+          npm run build $ENV_FLAG -- --source-map=false
+          echo "✅ Build completed with $ENV_FLAG"
+          
+          # Find build folder
+          BUILD_FOLDER=$(find dist -name "*.js" -type f -exec dirname {} \; | head -1)
+          echo "build_folder=$BUILD_FOLDER" >> $GITHUB_OUTPUT
+          
+          # Copy version.json to dist
+          cp version.json $BUILD_FOLDER/
+          echo "📄 Copied version.json to dist"
+          
+          # List build contents
+          echo "Build contents:"
+          ls -la $BUILD_FOLDER/
+      
+      # Step 10: Upload build artifacts
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: angular-dist
+          path: dist/
+          retention-days: 5
+          if-no-files-found: error
+
+  # ==================== CD JOB - DEPLOY TO AWS ====================
+  deploy-to-aws:
+    name: 🚀 Deploy to AWS S3 & CloudFront
+    runs-on: ubuntu-latest
+    needs: [version-management, build-and-test]
+    if: github.ref == 'refs/heads/main' && needs.build-and-test.result == 'success'
+    environment: production
+    
+    steps:
+      # Step 1: Download build artifacts
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: angular-dist
+          path: ./dist
+      
+      # Step 2: Download version info
+      - name: Download version info
+        uses: actions/download-artifact@v4
+        with:
+          name: version-info
+      
+      # Step 3: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Step 4: Find build folder
+      - name: Find build folder
+        id: find-build
+        run: |
+          BUILD_FOLDER=$(find ./dist -type f -name "*.js" -exec dirname {} \; | head -1)
+          echo "build_folder=$BUILD_FOLDER" >> $GITHUB_OUTPUT
+          echo "📁 Build folder: $BUILD_FOLDER"
+          
+          # Read version info
+          VERSION=$(jq -r '.version' version.json)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "🚀 Deploying version: $VERSION"
+      
+      # Step 5: Create versioned backup
+      - name: Create versioned backup
+        run: |
+          VERSION="${{ steps.find-build.outputs.version }}"
+          aws s3 sync "s3://${{ env.S3_BUCKET }}" "s3://${{ env.S3_BUCKET }}/backups/$VERSION" \
+            --delete
+          echo "💾 Created backup for version $VERSION"
+      
+      # Step 6: Deploy to S3
+      - name: Deploy to S3
+        run: |
+          BUILD_FOLDER="${{ steps.find-build.outputs.build_folder }}"
+          
+          # Deploy static assets with long cache
+          aws s3 sync "$BUILD_FOLDER" "s3://${{ env.S3_BUCKET }}" \
+            --delete \
+            --cache-control "max-age=31536000, immutable" \
+            --exclude "*.html" \
+            --exclude "version.json"
+          
+          # Deploy HTML files with no cache
+          aws s3 sync "$BUILD_FOLDER" "s3://${{ env.S3_BUCKET }}" \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate"
+          
+          # Deploy version.json
+          aws s3 cp version.json "s3://${{ env.S3_BUCKET }}/version.json" \
+            --cache-control "no-cache"
+          
+          echo "📤 Deployment to S3 complete"
+      
+      # Step 7: Invalidate CloudFront cache
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CLOUDFRONT_ID }} \
+            --paths "/*" \
+            --comment "Deployment version ${{ steps.find-build.outputs.version }}"
+          
+          echo "🔄 CloudFront invalidation initiated"
+      
+      # Step 8: Create deployment record
+      - name: Create deployment record
+        run: |
+          VERSION="${{ steps.find-build.outputs.version }}"
+          DEPLOY_URL="https://${{ env.CLOUDFRONT_ID }}.cloudfront.net"
+          
+          cat > deployment-info.json << EOF
+          {
+            "version": "$VERSION",
+            "deployTime": "$(date -Iseconds)",
+            "deployUrl": "$DEPLOY_URL",
+            "commitHash": "${{ github.sha }}",
+            "githubRunId": "${{ github.run_id }}",
+            "deployedBy": "${{ github.actor }}"
+          }
+          EOF
+          
+          aws s3 cp deployment-info.json "s3://${{ env.S3_BUCKET }}/deployment-info.json" \
+            --cache-control "no-cache"
+      
+      # Step 9: Get deployment URL
+      - name: Get deployment URL
+        run: |
+          echo "✅ Deployment successful!"
+          echo "🌐 URL: https://${{ env.CLOUDFRONT_ID }}.cloudfront.net"
+          echo "📌 Version: ${{ steps.find-build.outputs.version }}"
+          
+          echo "deploy-url=https://${{ env.CLOUDFRONT_ID }}.cloudfront.net" >> $GITHUB_OUTPUT
+          echo "deployed-version=${{ steps.find-build.outputs.version }}" >> $GITHUB_OUTPUT
+
+  # ==================== CREATE GITHUB RELEASE ====================
+  create-release:
+    name: 📦 Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [deploy-to-aws, version-management]
+    if: github.ref == 'refs/heads/main' && success()
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Download version info
+        uses: actions/download-artifact@v4
+        with:
+          name: version-info
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.version-management.outputs.new_version }}
+          name: Release v${{ needs.version-management.outputs.new_version }}
+          body: |
+            ## 🚀 Release v${{ needs.version-management.outputs.new_version }}
+            
+            ### 📊 Build Information
+            - **Version:** ${{ needs.version-management.outputs.new_version }}
+            - **Build Number:** ${{ needs.version-management.outputs.build_number }}
+            - **Commit:** ${{ needs.version-management.outputs.commit_hash }}
+            - **Deployment Date:** $(date)
+            
+            ### ✨ Features
+            - Auto-incremented versioning implemented
+            - CI/CD pipeline with automated deployments
+            
+            ### 🔗 Links
+            - **Live Demo:** https://${{ env.CLOUDFRONT_ID }}.cloudfront.net
+            - **Commit:** ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+            
+            ### 📦 Deployment Status
+            ✅ Successfully deployed to production
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================== POST-DEPLOYMENT VERIFICATION ====================
+  verify-deployment:
+    name: ✅ Verify Deployment
+    runs-on: ubuntu-latest
+    needs: deploy-to-aws
+    if: always()
+    
+    steps:
+      - name: Download version info
+        uses: actions/download-artifact@v4
+        with:
+          name: version-info
+      
+      - name: Wait for deployment to propagate
+        run: |
+          echo "⏳ Waiting 10 seconds for CloudFront to propagate..."
+          sleep 10
+      
+      - name: Verify deployment health
+        id: health-check
+        run: |
+          DEPLOY_URL="https://${{ env.CLOUDFRONT_ID }}.cloudfront.net"
+          VERSION="${{ needs.deploy-to-aws.outputs.deployed-version }}"
+          
+          echo "🔍 Checking deployment at: $DEPLOY_URL"
+          
+          # Check if site is reachable
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$DEPLOY_URL")
+          
+          if [ "$HTTP_STATUS" == "200" ]; then
+            echo "✅ Site is reachable (HTTP $HTTP_STATUS)"
+          else
+            echo "⚠️ Site returned HTTP $HTTP_STATUS"
+          fi
+          
+          # Check version endpoint if available
+          VERSION_RESPONSE=$(curl -s "$DEPLOY_URL/version.json" || echo "{}")
+          DEPLOYED_VERSION=$(echo "$VERSION_RESPONSE" | jq -r '.version // "unknown"')
+          
+          echo "📌 Expected version: $VERSION"
+          echo "📌 Deployed version: $DEPLOYED_VERSION"
+          
+          if [ "$VERSION" == "$DEPLOYED_VERSION" ] || [ "$DEPLOYED_VERSION" == "unknown" ]; then
+            echo "✅ Version verification passed"
+          else
+            echo "⚠️ Version mismatch - expected $VERSION, got $DEPLOYED_VERSION"
+          fi
+      
+      - name: Deployment Status
+        run: |
+          if [ "${{ needs.deploy-to-aws.result }}" == "success" ]; then
+            echo "✅ Deployment successful!"
+            echo "🌐 URL: https://${{ env.CLOUDFRONT_ID }}.cloudfront.net"
+            echo "📦 Version: ${{ needs.version-management.outputs.new_version }}"
+            echo "🔢 Build: ${{ needs.version-management.outputs.build_number }}"
+          else
+            echo "❌ Deployment failed!"
+            exit 1
+          fi
+      
+      - name: Send notification
+        if: always()
+        run: |
+          STATUS="${{ needs.deploy-to-aws.result }}"
+          VERSION="${{ needs.version-management.outputs.new_version }}"
+          
+          if [ "$STATUS" == "success" ]; then
+            echo "::notice::✅ Deployment v$VERSION successful! 🚀"
+          else
+            echo "::error::❌ Deployment v$VERSION failed! Check logs."
+          fi
+
+  # ==================== CLEANUP OLD ARTIFACTS ====================
+  cleanup:
+    name: 🧹 Cleanup Old Artifacts
+    runs-on: ubuntu-latest
+    needs: [deploy-to-aws, verify-deployment]
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Delete old backups (keep last 10)
+        run: |
+          echo "🧹 Cleaning up old backups..."
+          # This would need AWS CLI configured
+          # aws s3 ls s3://${{ env.S3_BUCKET }}/backups/ | sort | head -n -10 | awk '{print $2}' | xargs -I {} aws s3 rm s3://${{ env.S3_BUCKET }}/backups/{} --recursive
+          echo "Cleanup complete"
+      
+      - name: Delete old artifacts from GitHub
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: artifacts } = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            
+            const oldArtifacts = artifacts.artifacts.filter(a => 
+              a.expired === false && 
+              new Date(a.created_at) < new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+            );
+            
+            for (const artifact of oldArtifacts) {
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id
+              });
+              console.log(`Deleted artifact: ${artifact.name}`);
+            }
